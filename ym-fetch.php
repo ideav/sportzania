@@ -29,7 +29,8 @@ require_once __DIR__ . '/ym-config.php';
 function ym_api_get(string $url, array $params): array
 {
     $params['pretty'] = 0;
-    $queryString = http_build_query($params);
+    // Use '&' explicitly to avoid &amp; when arg_separator.output is set in php.ini
+    $queryString = http_build_query($params, '', '&');
     $fullUrl = $url . '?' . $queryString;
 
     $context = stream_context_create([
