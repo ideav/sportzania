@@ -64,13 +64,18 @@ function ym_api_get(string $url, array $params): array
 }
 
 /**
- * Запрашивает отчёт Logs API / Stat API с разбивкой по дням (group=day).
+ * Запрашивает отчёт Stat API с разбивкой по дням через /stat/v1/data.
  *
- * @param array  $metrics   Список метрик (ym:s:xxx)
- * @param array  $dimensions Список измерений (ym:s:xxx) — может быть пустым
- * @param string $dateFrom  Начало периода YYYY-MM-DD
- * @param string $dateTo    Конец периода YYYY-MM-DD
- * @param int    $offset    Смещение для пагинации
+ * Используется только для метрик, совместимых с dimension=ym:s:date
+ * (простые счётчики: visits, users, pageviews и т.д.).
+ * Для вычисляемых/агрегированных метрик (pageDepth, visitDuration, bounceRate,
+ * pageLoadTime) используйте ym_bytime_get().
+ *
+ * @param array  $metrics    Список метрик (ym:s:xxx)
+ * @param array  $dimensions Список измерений (ym:s:xxx) — не должен быть пустым
+ * @param string $dateFrom   Начало периода YYYY-MM-DD
+ * @param string $dateTo     Конец периода YYYY-MM-DD
+ * @param int    $offset     Смещение для пагинации
  * @return array  Ответ API (поле 'data' — строки, 'total_rows' — всего строк)
  */
 function ym_stat_get(array $metrics, array $dimensions, string $dateFrom, string $dateTo, int $offset = 1): array
@@ -88,16 +93,65 @@ function ym_stat_get(array $metrics, array $dimensions, string $dateFrom, string
 
     if (!empty($dimensions)) {
         $params['dimensions'] = implode(',', $dimensions);
-        // ym:s:date dimension already implies per-day grouping;
-        // passing group=day alongside it causes HTTP 400.
-        if (!in_array('ym:s:date', $dimensions, true)) {
-            $params['group'] = 'day';
-        }
-    } else {
-        $params['group'] = 'day';
     }
 
     return ym_api_get('https://api-metrika.yandex.net/stat/v1/data', $params);
+}
+
+/**
+ * Запрашивает временной ряд метрик через /stat/v1/data/bytime с group=day.
+ *
+ * Этот эндпоинт предназначен для вычисляемых/агрегированных метрик
+ * (pageDepth, visitDuration, bounceRate, pageLoadTime), которые не поддерживают
+ * параметр dimensions в /stat/v1/data и возвращают HTTP 400, если их запрашивать
+ * через /stat/v1/data с group=day.
+ *
+ * Структура ответа отличается от /stat/v1/data:
+ * - data[i].metrics — двумерный массив [метрика][временной_слот], а не плоский
+ * - временная ось восстанавливается из query.date1, query.date2 и group=day
+ * - нет limit/offset; top_keys ограничивает количество строк измерений (макс. 30)
+ *
+ * @param array  $metrics  Список метрик (ym:s:xxx)
+ * @param string $dateFrom Начало периода YYYY-MM-DD
+ * @param string $dateTo   Конец периода YYYY-MM-DD
+ * @return array  Ответ API (/stat/v1/data/bytime)
+ */
+function ym_bytime_get(array $metrics, string $dateFrom, string $dateTo): array
+{
+    $params = [
+        'id'       => YM_COUNTER_ID,
+        'metrics'  => implode(',', $metrics),
+        'date1'    => $dateFrom,
+        'date2'    => $dateTo,
+        'group'    => 'day',
+        'accuracy' => 'full',
+        'lang'     => 'ru',
+    ];
+
+    return ym_api_get('https://api-metrika.yandex.net/stat/v1/data/bytime', $params);
+}
+
+/**
+ * Восстанавливает массив дат в формате YYYY-MM-DD для временного ряда
+ * из ответа /stat/v1/data/bytime с group=day.
+ *
+ * Временная ось в bytime неявная: значения метрик упорядочены по дням от date1 до date2.
+ *
+ * @param array $query Поле 'query' из ответа /stat/v1/data/bytime
+ * @return string[]
+ */
+function ym_bytime_dates(array $query): array
+{
+    $dates   = [];
+    $current = strtotime($query['date1']);
+    $end     = strtotime($query['date2']);
+
+    while ($current <= $end) {
+        $dates[] = date('Y-m-d', $current);
+        $current = strtotime('+1 day', $current);
+    }
+
+    return $dates;
 }
 
 /**
@@ -196,9 +250,10 @@ function ym_dim_value(array $dimValues, int $index): string
  *          глубина, время, отказы.
  *
  * NOTE: Yandex Metrika API returns HTTP 400 when calculated/ratio metrics
- * (pageDepth, visitDuration, bounceRate) are combined with any dimensions.
- * They must be fetched separately without dimensions using group=day,
- * then merged with the counts-by-date data.
+ * (pageDepth, avgVisitDurationSeconds, bounceRate) are requested via
+ * /stat/v1/data — even without dimensions. The group=day parameter is not
+ * valid on /stat/v1/data; it belongs to /stat/v1/data/bytime.
+ * Calculated metrics are fetched via ym_bytime_get() and merged by date.
  */
 function fetch_traffic_engagement(): void
 {
@@ -210,18 +265,26 @@ function fetch_traffic_engagement(): void
         ['ym:s:date']
     );
 
-    // Request B: calculated/ratio metrics — do NOT support dimensions;
-    // use group=day (empty dimensions array triggers group=day in ym_stat_get)
-    $calcRows = ym_fetch_all_rows(
-        ['ym:s:pageDepth', 'ym:s:visitDuration', 'ym:s:bounceRate'],
-        []
+    // Request B: calculated/ratio metrics — not supported on /stat/v1/data with any
+    // dimensions or group=day. Use /stat/v1/data/bytime which accepts group=day for
+    // these metrics. Response is a time-series: metrics[][slot] not metrics[].
+    $calcResponse = ym_bytime_get(
+        ['ym:s:pageDepth', 'ym:s:avgVisitDurationSeconds', 'ym:s:bounceRate'],
+        YM_DATE_FROM,
+        YM_DATE_TO
     );
+    $calcDates = ym_bytime_dates($calcResponse['query']);
 
-    // Index calculated metrics by date for merging
+    // Index calculated metrics by date for merging.
+    // data[0].metrics[metricIndex][slotIndex] — no dimensions, so data has one row.
     $calcByDate = [];
-    foreach ($calcRows as $row) {
-        $date = $row['dimensions'][0]['name'] ?? $row['dimensions'][0]['id'] ?? '';
-        $calcByDate[$date] = $row['metrics'];
+    $calcData   = $calcResponse['data'][0]['metrics'] ?? [];
+    foreach ($calcDates as $slotIndex => $date) {
+        $calcByDate[$date] = [
+            $calcData[0][$slotIndex] ?? null,  // pageDepth
+            $calcData[1][$slotIndex] ?? null,  // avgVisitDurationSeconds
+            $calcData[2][$slotIndex] ?? null,  // bounceRate
+        ];
     }
 
     $headers = [
@@ -231,7 +294,7 @@ function fetch_traffic_engagement(): void
         'Просмотры страниц',
         'Новые посетители',
         'Средняя глубина просмотра',
-        'Среднее время на сайте (сек)',
+        'Среднее время визита (сек)',
         'Отказы (%)',
     ];
 
@@ -492,30 +555,31 @@ function fetch_audience_demographics(): void
 
 /**
  * 8. Технические метрики — время загрузки страниц.
- * Dimensions: нет (group=day)
- * Metrics: pageLoadTime.
+ * Metrics: pageLoadTime (вычисляемая метрика, не поддерживает dimensions).
  *
- * NOTE: pageLoadTime is a calculated/ratio metric that does not support
- * dimensions in the Yandex Metrika API. Fetched without dimensions using
- * group=day; the date comes from the dimensions field of the response.
+ * NOTE: pageLoadTime is a calculated/ratio metric that does not support any
+ * dimensions on /stat/v1/data (HTTP 400), and group=day is not a valid parameter
+ * for /stat/v1/data either. Use /stat/v1/data/bytime which accepts group=day for
+ * these metrics. Date sequence is reconstructed from query.date1/date2.
  */
 function fetch_technical(): void
 {
     echo "  Запрашиваем: Технические метрики...\n";
 
-    // pageLoadTime is a calculated metric — cannot be combined with dimensions.
-    // Empty dimensions array causes ym_stat_get to use group=day instead.
-    $metrics = ['ym:s:pageLoadTime'];
+    // pageLoadTime is a calculated metric — use /stat/v1/data/bytime.
+    $response = ym_bytime_get(['ym:s:pageLoadTime'], YM_DATE_FROM, YM_DATE_TO);
+    $dates    = ym_bytime_dates($response['query']);
 
-    $rows = ym_fetch_all_rows($metrics, []);
+    // No dimensions: data has one row; metrics[0][slot] = value per day.
+    $metricValues = $response['data'][0]['metrics'][0] ?? [];
 
     $headers = ['Дата', 'Среднее время загрузки страниц (сек)'];
 
     $csvRows = [];
-    foreach ($rows as $row) {
+    foreach ($dates as $slotIndex => $date) {
         $csvRows[] = [
-            ym_dim_value($row['dimensions'], 0),
-            ym_format_value($row['metrics'][0] ?? ''),
+            $date,
+            ym_format_value($metricValues[$slotIndex] ?? ''),
         ];
     }
 
