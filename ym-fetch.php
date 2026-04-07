@@ -68,8 +68,8 @@ function ym_api_get(string $url, array $params): array
  *
  * Используется только для метрик, совместимых с dimension=ym:s:date
  * (простые счётчики: visits, users, pageviews и т.д.).
- * Для вычисляемых/агрегированных метрик (pageDepth, visitDuration, bounceRate,
- * pageLoadTime) используйте ym_bytime_get().
+ * Для вычисляемых/агрегированных метрик (pageDepth, visitDuration, bounceRate)
+ * используйте ym_bytime_get().
  *
  * @param array  $metrics    Список метрик (ym:s:xxx)
  * @param array  $dimensions Список измерений (ym:s:xxx) — не должен быть пустым
@@ -102,7 +102,7 @@ function ym_stat_get(array $metrics, array $dimensions, string $dateFrom, string
  * Запрашивает временной ряд метрик через /stat/v1/data/bytime с group=day.
  *
  * Этот эндпоинт предназначен для вычисляемых/агрегированных метрик
- * (pageDepth, visitDuration, bounceRate, pageLoadTime), которые не поддерживают
+ * (pageDepth, visitDuration, bounceRate), которые не поддерживают
  * параметр dimensions в /stat/v1/data и возвращают HTTP 400, если их запрашивать
  * через /stat/v1/data с group=day.
  *
@@ -554,32 +554,47 @@ function fetch_audience_demographics(): void
 }
 
 /**
- * 8. Технические метрики — время загрузки страниц.
- * Metrics: pageLoadTime (вычисляемая метрика, не поддерживает dimensions).
+ * 8. Технические метрики — доля мобильных, JS, cookies и блокировщики по дням.
  *
- * NOTE: pageLoadTime is a calculated/ratio metric that does not support any
- * dimensions on /stat/v1/data (HTTP 400), and group=day is not a valid parameter
- * for /stat/v1/data either. Use /stat/v1/data/bytime which accepts group=day for
- * these metrics. Date sequence is reconstructed from query.date1/date2.
+ * NOTE: ym:s:pageLoadTime does not exist in the Yandex Metrika Reports API and
+ * causes HTTP 400 on any endpoint. The API documentation lists only five valid
+ * technology metrics for sessions: mobilePercentage, jsEnabledPercentage,
+ * cookieEnabledPercentage, thirdPartyCookieEnabledPercentage, blockedPercentage.
+ * These are ratio metrics that work with dimensions=ym:s:date on /stat/v1/data.
  */
 function fetch_technical(): void
 {
     echo "  Запрашиваем: Технические метрики...\n";
 
-    // pageLoadTime is a calculated metric — use /stat/v1/data/bytime.
-    $response = ym_bytime_get(['ym:s:pageLoadTime'], YM_DATE_FROM, YM_DATE_TO);
-    $dates    = ym_bytime_dates($response['query']);
+    $rows = ym_fetch_all_rows(
+        [
+            'ym:s:mobilePercentage',
+            'ym:s:jsEnabledPercentage',
+            'ym:s:cookieEnabledPercentage',
+            'ym:s:thirdPartyCookieEnabledPercentage',
+            'ym:s:blockedPercentage',
+        ],
+        ['ym:s:date']
+    );
 
-    // No dimensions: data has one row; metrics[0][slot] = value per day.
-    $metricValues = $response['data'][0]['metrics'][0] ?? [];
-
-    $headers = ['Дата', 'Среднее время загрузки страниц (сек)'];
+    $headers = [
+        'Дата',
+        'Доля мобильных сессий (%)',
+        'Доля сессий с JavaScript (%)',
+        'Доля сессий с cookies (%)',
+        'Доля сессий со сторонними cookies (%)',
+        'Доля сессий с блокировщиками рекламы (%)',
+    ];
 
     $csvRows = [];
-    foreach ($dates as $slotIndex => $date) {
+    foreach ($rows as $row) {
         $csvRows[] = [
-            $date,
-            ym_format_value($metricValues[$slotIndex] ?? ''),
+            ym_dim_value($row['dimensions'], 0),
+            ym_format_value($row['metrics'][0] ?? ''),
+            ym_format_value($row['metrics'][1] ?? ''),
+            ym_format_value($row['metrics'][2] ?? ''),
+            ym_format_value($row['metrics'][3] ?? ''),
+            ym_format_value($row['metrics'][4] ?? ''),
         ];
     }
 
