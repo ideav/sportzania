@@ -194,23 +194,35 @@ function ym_dim_value(array $dimValues, int $index): string
  * Dimensions: дата (ym:s:date)
  * Metrics: визиты, посетители, просмотры, новые посетители,
  *          глубина, время, отказы.
+ *
+ * NOTE: Yandex Metrika API returns HTTP 400 when calculated/ratio metrics
+ * (pageDepth, visitDuration, bounceRate) are combined with any dimensions.
+ * They must be fetched separately without dimensions using group=day,
+ * then merged with the counts-by-date data.
  */
 function fetch_traffic_engagement(): void
 {
     echo "  Запрашиваем: Посещаемость и вовлеченность...\n";
 
-    $dimensions = ['ym:s:date'];
-    $metrics = [
-        'ym:s:visits',
-        'ym:s:users',
-        'ym:s:pageviews',
-        'ym:s:newUsers',
-        'ym:s:pageDepth',
-        'ym:s:visitDuration',
-        'ym:s:bounceRate',
-    ];
+    // Request A: simple count metrics — support dimensions=ym:s:date
+    $countRows = ym_fetch_all_rows(
+        ['ym:s:visits', 'ym:s:users', 'ym:s:pageviews', 'ym:s:newUsers'],
+        ['ym:s:date']
+    );
 
-    $rows = ym_fetch_all_rows($metrics, $dimensions);
+    // Request B: calculated/ratio metrics — do NOT support dimensions;
+    // use group=day (empty dimensions array triggers group=day in ym_stat_get)
+    $calcRows = ym_fetch_all_rows(
+        ['ym:s:pageDepth', 'ym:s:visitDuration', 'ym:s:bounceRate'],
+        []
+    );
+
+    // Index calculated metrics by date for merging
+    $calcByDate = [];
+    foreach ($calcRows as $row) {
+        $date = $row['dimensions'][0]['name'] ?? $row['dimensions'][0]['id'] ?? '';
+        $calcByDate[$date] = $row['metrics'];
+    }
 
     $headers = [
         'Дата',
@@ -224,16 +236,18 @@ function fetch_traffic_engagement(): void
     ];
 
     $csvRows = [];
-    foreach ($rows as $row) {
+    foreach ($countRows as $row) {
+        $date = ym_dim_value($row['dimensions'], 0);
+        $calc = $calcByDate[$date] ?? [null, null, null];
         $csvRows[] = [
-            ym_dim_value($row['dimensions'], 0),
+            $date,
             ym_format_value($row['metrics'][0] ?? ''),
             ym_format_value($row['metrics'][1] ?? ''),
             ym_format_value($row['metrics'][2] ?? ''),
             ym_format_value($row['metrics'][3] ?? ''),
-            ym_format_value($row['metrics'][4] ?? ''),
-            ym_format_value($row['metrics'][5] ?? ''),
-            ym_format_value($row['metrics'][6] ?? ''),
+            ym_format_value($calc[0] ?? ''),
+            ym_format_value($calc[1] ?? ''),
+            ym_format_value($calc[2] ?? ''),
         ];
     }
 
@@ -478,17 +492,22 @@ function fetch_audience_demographics(): void
 
 /**
  * 8. Технические метрики — время загрузки страниц.
- * Dimensions: дата
+ * Dimensions: нет (group=day)
  * Metrics: pageLoadTime.
+ *
+ * NOTE: pageLoadTime is a calculated/ratio metric that does not support
+ * dimensions in the Yandex Metrika API. Fetched without dimensions using
+ * group=day; the date comes from the dimensions field of the response.
  */
 function fetch_technical(): void
 {
     echo "  Запрашиваем: Технические метрики...\n";
 
-    $dimensions = ['ym:s:date'];
-    $metrics    = ['ym:s:pageLoadTime'];
+    // pageLoadTime is a calculated metric — cannot be combined with dimensions.
+    // Empty dimensions array causes ym_stat_get to use group=day instead.
+    $metrics = ['ym:s:pageLoadTime'];
 
-    $rows = ym_fetch_all_rows($metrics, $dimensions);
+    $rows = ym_fetch_all_rows($metrics, []);
 
     $headers = ['Дата', 'Среднее время загрузки страниц (сек)'];
 
