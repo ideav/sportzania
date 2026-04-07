@@ -75,19 +75,25 @@ function ym_api_get(string $url, array $params): array
 function ym_stat_get(array $metrics, array $dimensions, string $dateFrom, string $dateTo, int $offset = 1): array
 {
     $params = [
-        'id'         => YM_COUNTER_ID,
-        'metrics'    => implode(',', $metrics),
-        'date1'      => $dateFrom,
-        'date2'      => $dateTo,
-        'group'      => 'day',
-        'limit'      => YM_API_LIMIT,
-        'offset'     => $offset,
-        'accuracy'   => 'full',
-        'lang'       => 'ru',
+        'id'       => YM_COUNTER_ID,
+        'metrics'  => implode(',', $metrics),
+        'date1'    => $dateFrom,
+        'date2'    => $dateTo,
+        'limit'    => YM_API_LIMIT,
+        'offset'   => $offset,
+        'accuracy' => 'full',
+        'lang'     => 'ru',
     ];
 
     if (!empty($dimensions)) {
         $params['dimensions'] = implode(',', $dimensions);
+        // ym:s:date dimension already implies per-day grouping;
+        // passing group=day alongside it causes HTTP 400.
+        if (!in_array('ym:s:date', $dimensions, true)) {
+            $params['group'] = 'day';
+        }
+    } else {
+        $params['group'] = 'day';
     }
 
     return ym_api_get('https://api-metrika.yandex.net/stat/v1/data', $params);
