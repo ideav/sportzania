@@ -239,6 +239,36 @@ function ym_dim_value(array $dimValues, int $index): string
     return $val['name'] ?? $val['id'] ?? '';
 }
 
+/**
+ * Получает список всех целей счётчика через Management API.
+ *
+ * Endpoint: GET https://api-metrika.yandex.net/management/v1/counter/{id}/goals
+ *
+ * @return array  Массив целей, каждая из которых содержит 'id' и 'name'.
+ *                Возвращает пустой массив, если целей нет или запрос не удался.
+ */
+function ym_fetch_goals(): array
+{
+    $url = 'https://api-metrika.yandex.net/management/v1/counter/' . YM_COUNTER_ID . '/goals';
+
+    try {
+        $data = ym_api_get($url, []);
+    } catch (RuntimeException $e) {
+        echo "  Предупреждение: не удалось получить цели счётчика: " . $e->getMessage() . "\n";
+        return [];
+    }
+
+    $goals = [];
+    foreach ($data['goals'] ?? [] as $goal) {
+        $goals[] = [
+            'id'   => (int) $goal['id'],
+            'name' => (string) ($goal['name'] ?? $goal['id']),
+        ];
+    }
+
+    return $goals;
+}
+
 // -----------------------------------------------------------------------
 // Функции для каждого раздела дэшборда
 // -----------------------------------------------------------------------
@@ -320,15 +350,15 @@ function fetch_traffic_engagement(): void
 
 /**
  * 2. Конверсии и эффективность по целям.
- * Dimensions: дата, цель
- * Метрики запрашиваются для каждой цели из YM_GOAL_IDS.
+ * Dimensions: дата
+ * Метрики запрашиваются для каждой цели из переданного массива $goals.
+ *
+ * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
-function fetch_conversions(): void
+function fetch_conversions(array $goals): void
 {
-    $goalIds = YM_GOAL_IDS;
-
-    if (empty($goalIds)) {
-        echo "  Пропускаем: Конверсии (YM_GOAL_IDS не заданы в конфиге).\n";
+    if (empty($goals)) {
+        echo "  Пропускаем: Конверсии (цели не найдены в счётчике).\n";
         return;
     }
 
@@ -336,17 +366,17 @@ function fetch_conversions(): void
 
     $dimensions = ['ym:s:date'];
     $metrics = [];
-    foreach ($goalIds as $goalId) {
-        $metrics[] = "ym:s:goal{$goalId}conversionRate";
-        $metrics[] = "ym:s:goal{$goalId}reaches";
+    foreach ($goals as $goal) {
+        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
+        $metrics[] = "ym:s:goal{$goal['id']}reaches";
     }
 
     $rows = ym_fetch_all_rows($metrics, $dimensions);
 
     $headers = ['Дата'];
-    foreach ($goalIds as $goalId) {
-        $headers[] = "Конверсия цели $goalId (%)";
-        $headers[] = "Достижения цели $goalId";
+    foreach ($goals as $goal) {
+        $headers[] = "Конверсия «{$goal['name']}» (%)";
+        $headers[] = "Достижения «{$goal['name']}»";
     }
 
     $csvRows = [];
@@ -365,25 +395,26 @@ function fetch_conversions(): void
 /**
  * 3. Источники трафика — распределение визитов по каналам.
  * Dimensions: дата, источник трафика
- * Metrics: визиты + конверсия (если заданы цели).
+ * Metrics: визиты + конверсия по целям.
+ *
+ * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
-function fetch_traffic_sources(): void
+function fetch_traffic_sources(array $goals): void
 {
     echo "  Запрашиваем: Источники трафика...\n";
 
-    $goalIds    = YM_GOAL_IDS;
     $dimensions = ['ym:s:date', 'ym:s:trafficSource'];
     $metrics    = ['ym:s:visits'];
 
-    foreach ($goalIds as $goalId) {
-        $metrics[] = "ym:s:goal{$goalId}conversionRate";
+    foreach ($goals as $goal) {
+        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
     }
 
     $rows = ym_fetch_all_rows($metrics, $dimensions);
 
     $headers = ['Дата', 'Источник трафика', 'Визиты'];
-    foreach ($goalIds as $goalId) {
-        $headers[] = "Конверсия цели $goalId (%)";
+    foreach ($goals as $goal) {
+        $headers[] = "Конверсия «{$goal['name']}» (%)";
     }
 
     $csvRows = [];
@@ -407,12 +438,13 @@ function fetch_traffic_sources(): void
  * 4а. UTM-метки — детализация по utm_source / utm_medium / utm_campaign / utm_content / utm_term.
  * Dimensions: дата, utm-параметры
  * Metrics: визиты + конверсии по целям.
+ *
+ * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
-function fetch_utm(): void
+function fetch_utm(array $goals): void
 {
     echo "  Запрашиваем: UTM-метки...\n";
 
-    $goalIds    = YM_GOAL_IDS;
     $dimensions = [
         'ym:s:date',
         'ym:s:UTMSource',
@@ -422,9 +454,9 @@ function fetch_utm(): void
         'ym:s:UTMTerm',
     ];
     $metrics = ['ym:s:visits'];
-    foreach ($goalIds as $goalId) {
-        $metrics[] = "ym:s:goal{$goalId}conversionRate";
-        $metrics[] = "ym:s:goal{$goalId}reaches";
+    foreach ($goals as $goal) {
+        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
+        $metrics[] = "ym:s:goal{$goal['id']}reaches";
     }
 
     $rows = ym_fetch_all_rows($metrics, $dimensions);
@@ -438,9 +470,9 @@ function fetch_utm(): void
         'UTM Term',
         'Визиты',
     ];
-    foreach ($goalIds as $goalId) {
-        $headers[] = "Конверсия цели $goalId (%)";
-        $headers[] = "Достижения цели $goalId";
+    foreach ($goals as $goal) {
+        $headers[] = "Конверсия «{$goal['name']}» (%)";
+        $headers[] = "Достижения «{$goal['name']}»";
     }
 
     $csvRows = [];
@@ -599,7 +631,31 @@ echo "Период:   " . YM_DATE_FROM . " — " . YM_DATE_TO . "\n";
 echo "Папка:    " . YM_OUTPUT_DIR . "\n";
 echo "-------------------------------------------------------\n";
 
+// Получаем список всех целей счётчика один раз и передаём во все функции.
+echo "  Загружаем цели счётчика...\n";
+$goals = ym_fetch_goals();
+if (!empty($goals)) {
+    $goalNames = implode(', ', array_map(fn($g) => "«{$g['name']}» (ID {$g['id']})", $goals));
+    echo "  Найдено целей: " . count($goals) . " — $goalNames\n";
+} else {
+    echo "  Целей не найдено. Разделы конверсий будут пропущены.\n";
+}
+echo "-------------------------------------------------------\n";
+
+$errors = [];
+
 $sections = [
+    fn() => fetch_traffic_engagement(),
+    fn() => fetch_conversions($goals),
+    fn() => fetch_traffic_sources($goals),
+    fn() => fetch_utm($goals),
+    fn() => fetch_audience_geo(),
+    fn() => fetch_audience_devices(),
+    fn() => fetch_audience_demographics(),
+    fn() => fetch_technical(),
+];
+
+$sectionNames = [
     'fetch_traffic_engagement',
     'fetch_conversions',
     'fetch_traffic_sources',
@@ -610,13 +666,12 @@ $sections = [
     'fetch_technical',
 ];
 
-$errors = [];
-
-foreach ($sections as $fn) {
+foreach ($sections as $i => $fn) {
+    $name = $sectionNames[$i];
     try {
         $fn();
     } catch (Throwable $e) {
-        $msg = "  ОШИБКА в $fn(): " . $e->getMessage();
+        $msg = "  ОШИБКА в $name(): " . $e->getMessage();
         echo $msg . "\n";
         $errors[] = $msg;
     }
