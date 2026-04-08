@@ -41,5 +41,8 @@ define('YM_OUTPUT_DIR', __DIR__ . '/ym-data');
 // Максимальное количество строк в одном запросе к API (лимит Яндекса — 100000).
 define('YM_API_LIMIT', 10000);
 
+// Максимальное количество метрик в одном запросе к API (лимит Яндекса — 20).
+define('YM_METRICS_PER_REQUEST', 20);
+
 // Таймаут HTTP-запроса к API в секундах.
 define('YM_HTTP_TIMEOUT', 30);
