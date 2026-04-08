@@ -212,6 +212,85 @@ function ym_fetch_all_rows(array $metrics, array $dimensions): array
 }
 
 /**
+ * Извлекает все строки, автоматически разбивая большой список метрик на пакеты.
+ *
+ * Яндекс Метрика API возвращает HTTP 400, если в одном запросе передать более
+ * YM_METRICS_PER_REQUEST метрик (документированный лимит — 20). Когда счётчик
+ * содержит много целей, итоговое число метрик легко превышает этот лимит.
+ *
+ * Алгоритм:
+ *   1. Первый пакет: $baseMetrics + первые N целевых метрик (до лимита).
+ *   2. Последующие пакеты: только целевые метрики ($chunkMetrics) + $dimensions.
+ *   3. Строки из разных пакетов объединяются по ключу измерений.
+ *
+ * @param array $baseMetrics   Метрики, которые нужны в каждой строке (например, ym:s:visits).
+ * @param array $extraMetrics  Дополнительные метрики (целевые и т.п.) — могут быть очень большими.
+ * @param array $dimensions    Список измерений.
+ * @return array  Все строки в формате [['dimensions' => [...], 'metrics' => [...]], ...]
+ *                Метрики идут в порядке: сначала $baseMetrics, затем все $extraMetrics.
+ */
+function ym_fetch_all_rows_chunked(array $baseMetrics, array $extraMetrics, array $dimensions): array
+{
+    $maxPerRequest = YM_METRICS_PER_REQUEST;
+
+    // Если суммарное число метрик не превышает лимит — делаем один запрос.
+    if (count($baseMetrics) + count($extraMetrics) <= $maxPerRequest) {
+        return ym_fetch_all_rows(array_merge($baseMetrics, $extraMetrics), $dimensions);
+    }
+
+    // Индексируем строки по ключу измерений для последующего слияния.
+    // $indexed[$dimKey] = ['dimensions' => [...], 'metrics' => [...]]
+    $indexed = [];
+
+    // Размер первого пакета: базовые метрики занимают $baseCount мест.
+    $baseCount     = count($baseMetrics);
+    $chunkSize     = $maxPerRequest - $baseCount;
+    $extraChunks   = array_chunk($extraMetrics, $chunkSize);
+
+    foreach ($extraChunks as $chunkIndex => $chunk) {
+        // Первый пакет включает базовые метрики; последующие — только chunk.
+        $requestMetrics = ($chunkIndex === 0)
+            ? array_merge($baseMetrics, $chunk)
+            : $chunk;
+
+        $rows = ym_fetch_all_rows($requestMetrics, $dimensions);
+
+        foreach ($rows as $row) {
+            // Строим ключ из всех значений измерений.
+            $dimKey = implode('|', array_map(
+                fn($d) => ($d['name'] ?? $d['id'] ?? ''),
+                $row['dimensions']
+            ));
+
+            if (!isset($indexed[$dimKey])) {
+                $indexed[$dimKey] = [
+                    'dimensions' => $row['dimensions'],
+                    'metrics'    => ($chunkIndex === 0)
+                        ? $row['metrics']
+                        // Первый пакет не запрашивался — заполняем базовые метрики нулями.
+                        : array_fill(0, $baseCount, 0),
+                ];
+            }
+
+            if ($chunkIndex === 0) {
+                // Базовые метрики уже внутри; добавляем только хвост chunk.
+                $indexed[$dimKey]['metrics'] = array_merge(
+                    array_slice($indexed[$dimKey]['metrics'], 0, $baseCount),
+                    array_slice($row['metrics'], $baseCount)
+                );
+            } else {
+                // Добавляем метрики chunk к уже накопленным.
+                foreach ($row['metrics'] as $metricValue) {
+                    $indexed[$dimKey]['metrics'][] = $metricValue;
+                }
+            }
+        }
+    }
+
+    return array_values($indexed);
+}
+
+/**
  * Форматирует значение метрики для CSV (округление float, замена точки на запятую).
  *
  * @param mixed $value
@@ -353,6 +432,9 @@ function fetch_traffic_engagement(): void
  * Dimensions: дата
  * Метрики запрашиваются для каждой цели из переданного массива $goals.
  *
+ * При большом числе целей метрики автоматически разбиваются на пакеты,
+ * чтобы не превышать лимит YM_METRICS_PER_REQUEST метрик в одном запросе.
+ *
  * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
 function fetch_conversions(array $goals): void
@@ -364,14 +446,16 @@ function fetch_conversions(array $goals): void
 
     echo "  Запрашиваем: Конверсии и эффективность...\n";
 
-    $dimensions = ['ym:s:date'];
-    $metrics = [];
+    $dimensions   = ['ym:s:date'];
+    $extraMetrics = [];
     foreach ($goals as $goal) {
-        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
-        $metrics[] = "ym:s:goal{$goal['id']}reaches";
+        $extraMetrics[] = "ym:s:goal{$goal['id']}conversionRate";
+        $extraMetrics[] = "ym:s:goal{$goal['id']}reaches";
     }
 
-    $rows = ym_fetch_all_rows($metrics, $dimensions);
+    // Используем пакетный запрос: нет базовых метрик (только дата как dimension),
+    // все целевые метрики разбиваются на пакеты по YM_METRICS_PER_REQUEST.
+    $rows = ym_fetch_all_rows_chunked([], $extraMetrics, $dimensions);
 
     $headers = ['Дата'];
     foreach ($goals as $goal) {
@@ -397,20 +481,24 @@ function fetch_conversions(array $goals): void
  * Dimensions: дата, источник трафика
  * Metrics: визиты + конверсия по целям.
  *
+ * При большом числе целей метрики автоматически разбиваются на пакеты,
+ * чтобы не превышать лимит YM_METRICS_PER_REQUEST метрик в одном запросе.
+ *
  * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
 function fetch_traffic_sources(array $goals): void
 {
     echo "  Запрашиваем: Источники трафика...\n";
 
-    $dimensions = ['ym:s:date', 'ym:s:trafficSource'];
-    $metrics    = ['ym:s:visits'];
+    $dimensions   = ['ym:s:date', 'ym:s:trafficSource'];
+    $baseMetrics  = ['ym:s:visits'];
+    $extraMetrics = [];
 
     foreach ($goals as $goal) {
-        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
+        $extraMetrics[] = "ym:s:goal{$goal['id']}conversionRate";
     }
 
-    $rows = ym_fetch_all_rows($metrics, $dimensions);
+    $rows = ym_fetch_all_rows_chunked($baseMetrics, $extraMetrics, $dimensions);
 
     $headers = ['Дата', 'Источник трафика', 'Визиты'];
     foreach ($goals as $goal) {
@@ -439,6 +527,9 @@ function fetch_traffic_sources(array $goals): void
  * Dimensions: дата, utm-параметры
  * Metrics: визиты + конверсии по целям.
  *
+ * При большом числе целей метрики автоматически разбиваются на пакеты,
+ * чтобы не превышать лимит YM_METRICS_PER_REQUEST метрик в одном запросе.
+ *
  * @param array $goals  Массив целей [['id' => int, 'name' => string], ...]
  */
 function fetch_utm(array $goals): void
@@ -453,13 +544,14 @@ function fetch_utm(array $goals): void
         'ym:s:UTMContent',
         'ym:s:UTMTerm',
     ];
-    $metrics = ['ym:s:visits'];
+    $baseMetrics  = ['ym:s:visits'];
+    $extraMetrics = [];
     foreach ($goals as $goal) {
-        $metrics[] = "ym:s:goal{$goal['id']}conversionRate";
-        $metrics[] = "ym:s:goal{$goal['id']}reaches";
+        $extraMetrics[] = "ym:s:goal{$goal['id']}conversionRate";
+        $extraMetrics[] = "ym:s:goal{$goal['id']}reaches";
     }
 
-    $rows = ym_fetch_all_rows($metrics, $dimensions);
+    $rows = ym_fetch_all_rows_chunked($baseMetrics, $extraMetrics, $dimensions);
 
     $headers = [
         'Дата',
